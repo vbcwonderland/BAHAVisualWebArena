@@ -12,7 +12,8 @@ from vertexai.preview.generative_models import (
     Image,
 )
 
-model = GenerativeModel("gemini-pro-vision")
+#model = GenerativeModel("gemini-pro-vision")
+model = GenerativeModel("gemini-1.5-flash")
 
 
 def retry_with_exponential_backoff(  # type: ignore

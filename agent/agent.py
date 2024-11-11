@@ -21,6 +21,7 @@ from llms import (
     generate_from_huggingface_completion,
     generate_from_openai_chat_completion,
     generate_from_openai_completion,
+    generate_from_xai_chat_completion,
     lm_config,
 )
 from llms.tokenizers import Tokenizer
