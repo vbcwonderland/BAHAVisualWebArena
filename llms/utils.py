@@ -1,6 +1,8 @@
 import argparse
 from typing import Any
 
+from llms.providers.flamingo_utils import generate_from_flamingo_completion
+
 try:
     from vertexai.preview.generative_models import Image
     from llms import generate_from_gemini_completion
@@ -81,6 +83,11 @@ def call_llm(
             context_length=lm_config.gen_config["context_length"],
             max_tokens=lm_config.gen_config["max_tokens"],
             stop_token=None,
+        )
+    elif lm_config.provider == 'flamingo':
+        response = generate_from_flamingo_completion(
+            prompt,
+            max_new_tokens=lm_config.gen_config["max_new_tokens"],
         )
 
     else:

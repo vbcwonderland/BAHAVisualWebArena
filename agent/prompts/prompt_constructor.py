@@ -1,8 +1,9 @@
 import json
 import re
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, Dict, Tuple
 from PIL import Image
+import torch
 
 from browser_env import Action, ActionParsingError, Trajectory
 from browser_env.env_config import URL_MAPPINGS
@@ -28,6 +29,7 @@ class PromptConstructor(object):
         lm_config: lm_config.LMConfig,
         tokenizer: Tokenizer,
     ):
+
         self.instruction_path = Path(instruction_path)
         self.obs_modality = "text"
         self.lm_config = lm_config
@@ -35,6 +37,7 @@ class PromptConstructor(object):
         instruction["examples"] = [tuple(e) for e in instruction["examples"]]
         self.instruction: Instruction = instruction
         self.tokenizer = tokenizer
+        self.image_processor = tokenizer.image_processor
 
     def get_lm_api_input(
         self, intro: str, examples: list[tuple[str, str]], current: str
@@ -301,6 +304,8 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
             if self.lm_config.provider == "google":
                 print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
                 obs = obs[:max_obs_length]
+            elif self.lm_config.provider == "flamingo":
+                obs = self.tokenizer.tokenizer.decode(self.tokenizer.tokenizer.encode(obs[:2048])[:2048])
             else:
                 obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
 
@@ -330,7 +335,7 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
         images: list[Image.Image],
     ) -> APIInput:
         """Return the require format for an API"""
-        message: list[dict[str, str]] | str | list[str | Image.Image]
+        message: list[dict[str, str]] | str | list[str | Image.Image] | Tuple[Dict[str, torch.Tensor], torch.Tensor]
         if "openai" in self.lm_config.provider:
             if self.lm_config.mode == "chat":
                 message = [
@@ -440,6 +445,66 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
                 raise ValueError(
                     f"Gemini models do not support mode {self.lm_config.mode}"
                 )
+        elif "flamingo" in self.lm_config.provider:
+            if self.lm_config.mode == "completion":
+                message = [
+                    intro,
+                    "Here are a few examples:",
+                ]
+                for (x, y, z) in examples:
+                    example_img = Image.open(z)
+                    message.append(f"Observation\n:{x}\n")
+                    message.extend(
+                        [
+                            example_img,
+                            "IMAGES:",
+                            "(1) current page screenshot:",
+                            "<|endofchunk|>"
+                        ]
+                    )
+                    message.append(f"Action: {y}")
+                message.append("Now make prediction given the observation")
+                message.append(f"Observation\n:{current}\n")
+                message.extend(
+                    [
+                        page_screenshot_img,
+                        "IMAGES:",
+                        "(1) current page screenshot:",
+                        "<|endofchunk|>"
+
+                    ]
+                )
+                for image_i, image in enumerate(images):
+                    message.extend(
+                        [
+                            image,
+                            f"({image_i+2}) input image {image_i+1}",
+                            "<|endofchunk|>"
+                        ]
+                    )
+                message.append("Action:")
+
+                # once we have all the messages, we can preprocess image and create complete prompt
+                images = []
+                complete_prompt = ""
+                for m in message:
+                    if isinstance(m, str):
+                        complete_prompt += m
+                    else:
+                        complete_prompt += "<image>"
+                        images.append(m)
+                self.tokenizer.tokenizer.padding_side = "left"
+                lang_x = self.tokenizer.tokenizer( # TODO: Change tokenizer to accept more characters, probably cannot use openai
+                    [complete_prompt[:2048]],
+                    return_tensors="pt",
+                )
+
+                vision_x = [self.image_processor(img).unsqueeze(0) for img in images]
+
+                vision_x = torch.cat(vision_x, dim=0)
+                vision_x = vision_x.unsqueeze(1).unsqueeze(0)
+
+                return lang_x, vision_x
         else:
             raise NotImplementedError(
                 f"Provider {self.lm_config.provider} not implemented"
