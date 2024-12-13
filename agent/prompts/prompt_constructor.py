@@ -343,6 +343,7 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
         Perform iterative refinement of reasoning and actions.
         """
         most_recent_valid_action = None
+        most_recent_valid_response = None
         for iteration in range(self.max_iterations):
             # Generate reasoning and action
             prompt = self.get_lm_api_input(intro, examples, current, page_screenshot_img, images)
@@ -356,7 +357,9 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
                     reasoning, action = self.parse_response(response)
                     print(f'Parsed Action: {action}')
                     most_recent_valid_action = action
+                    most_recent_valid_response = response
                     print(f'Most Recent Valid Action: {most_recent_valid_action}')
+                    print(f'Most Recent Valid Response: {most_recent_valid_response}')
                     successful = True
                     break
                 except ActionParsingError as e:
@@ -368,7 +371,7 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
                 if self.is_reasoning_valid(reasoning) and self.is_action_valid(action):
                     print(f"Final Reasoning after {iteration + 1} iterations:\n{reasoning}")
                     print(f"Final Action after {iteration + 1} iterations:\n{action}")
-                    return action.strip()  # Return the refined action
+                    return f"Reasoning: {reasoning}\nAction: {action.strip()}"  # Return the refined action
 
                 # Construct dynamic feedback
                 feedback = self.construct_feedback(reasoning, action)
@@ -395,7 +398,8 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
             )
 
         print(f"Most Recent Valid Action Final: {most_recent_valid_action}")
-        return f"```{most_recent_valid_action}```" if most_recent_valid_action is not None else ""
+        print(f"Most Recent Valid Response Final: {most_recent_valid_response}")
+        return f"Reasoning: {most_recent_valid_response}\nAction: ```{most_recent_valid_action}```" if most_recent_valid_action is not None else ""
         # cannot throw or else it won't continue
         # raise ValueError("Failed to generate valid reasoning and action after maximum iterations.")
 
@@ -462,7 +466,7 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
             feedback_parts) if feedback_parts else "Good reasoning and action. No further refinement needed."
         return feedback
 
-class MultimodalCoTPromptConstructor(EnhancedCoTPromptConstructor):
+class MultimodalCoTPromptConstructorOld(EnhancedCoTPromptConstructor):
     """The agent will perform step-by-step reasoning before the answer"""
 
     def __init__(
@@ -474,45 +478,183 @@ class MultimodalCoTPromptConstructor(EnhancedCoTPromptConstructor):
         super().__init__(instruction_path, lm_config, tokenizer)
         self.answer_phrase = self.instruction["meta_data"]["answer_phrase"]
 
-    # def construct(
-    #     self,
-    #     trajectory: Trajectory,
-    #     intent: str,
-    #     page_screenshot_img: Image.Image,
-    #     images: list[Image.Image],
-    #     meta_data: dict[str, Any] = {},
-    # ) -> APIInput:
-    #     intro = self.instruction["intro"]
-    #     examples = self.instruction["examples"]
-    #     template = self.instruction["template"]
-    #     keywords = self.instruction["meta_data"]["keywords"]
-    #     state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
-    #
-    #     obs = state_info["observation"][self.obs_modality]
-    #     max_obs_length = self.lm_config.gen_config["max_obs_length"]
-    #     if max_obs_length:
-    #         if self.lm_config.provider == "google":
-    #             print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
-    #             obs = obs[:max_obs_length]
-    #         else:
-    #             obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
-    #
-    #     page = state_info["info"]["page"]
-    #     url = page.url
-    #     previous_action_str = meta_data["action_history"][-1]
-    #     current = template.format(
-    #         objective=intent,
-    #         url=self.map_url_to_real(url),
-    #         observation=obs,
-    #         previous_action=previous_action_str,
-    #     )
-    #
-    #     assert all([f"{{k}}" not in current for k in keywords])
-    #
-    #     prompt = self.get_lm_api_input(
-    #         intro, examples, current, page_screenshot_img, images
-    #     )
-    #     return prompt
+    def construct(
+        self,
+        trajectory: Trajectory,
+        intent: str,
+        page_screenshot_img: Image.Image,
+        images: list[Image.Image],
+        meta_data: dict[str, Any] = {},
+    ) -> APIInput:
+        intro = self.instruction["intro"]
+        examples = self.instruction["examples"]
+        template = self.instruction["template"]
+        keywords = self.instruction["meta_data"]["keywords"]
+        state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
+
+        obs = state_info["observation"][self.obs_modality]
+        max_obs_length = self.lm_config.gen_config["max_obs_length"]
+        if max_obs_length:
+            if self.lm_config.provider == "google":
+                print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
+                obs = obs[:max_obs_length]
+            else:
+                obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
+
+        page = state_info["info"]["page"]
+        url = page.url
+        previous_action_str = meta_data["action_history"][-1]
+        current = template.format(
+            objective=intent,
+            url=self.map_url_to_real(url),
+            observation=obs,
+            previous_action=previous_action_str,
+        )
+
+        assert all([f"{{k}}" not in current for k in keywords])
+
+        prompt = self.get_lm_api_input(
+            intro, examples, current, page_screenshot_img, images
+        )
+        return prompt
+
+    def get_lm_api_input(
+        self,
+        intro: str,
+        examples: list[tuple[str, str, str]],
+        current: str,
+        page_screenshot_img: Image.Image,
+        images: list[Image.Image],
+    ) -> APIInput:
+        """Return the require format for an API"""
+        message: list[dict[str, str]] | str | list[str | Image.Image]
+        if "openai" in self.lm_config.provider:
+            if self.lm_config.mode == "chat":
+                message = [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": intro}],
+                    }
+                ]
+                for (x, y, z) in examples:
+                    example_img = Image.open(z)
+                    message.append(
+                        {
+                            "role": "system",
+                            "name": "example_user",
+                            "content": [
+                                {"type": "text", "text": x},
+                                {
+                                    "type": "text",
+                                    "text": "IMAGES: (1) current page screenshot",
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": pil_to_b64(example_img)
+                                    },
+                                },
+                            ],
+                        }
+                    )
+                    message.append(
+                        {
+                            "role": "system",
+                            "name": "example_assistant",
+                            "content": [{"type": "text", "text": y}],
+                        }
+                    )
+
+                # Encode images and page_screenshot_img as base64 strings.
+                current_prompt = current
+                content = [
+                    {
+                        "type": "text",
+                        "text": "IMAGES: (1) current page screenshot",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": pil_to_b64(page_screenshot_img)},
+                    },
+                ]
+                for image_i, image in enumerate(images):
+                    content.extend(
+                        [
+                            {
+                                "type": "text",
+                                "text": f"({image_i+2}) input image {image_i+1}",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": pil_to_b64(image)},
+                            },
+                        ]
+                    )
+                content = [{"type": "text", "text": current_prompt}] + content
+
+                message.append({"role": "user", "content": content})
+                return message
+            else:
+                raise ValueError(
+                    f"GPT-4V models do not support mode {self.lm_config.mode}"
+                )
+        elif "google" in self.lm_config.provider:
+            if self.lm_config.mode == "completion":
+                # heuristics_text = "It is important to follow heuristics. Please make sure to check that you have followed these heuristics at each step. Here are some heuristics to should follow: "
+                # heuristics_text += ",".join(heuristics)
+                message = [
+                    intro,
+                    "Here are a few examples:",
+                ]
+                for (x, y, z) in examples:
+                    example_img = Image.open(z)
+                    message.append(f"Observation\n:{x}\n")
+                    message.extend(
+                        [
+                            "IMAGES:",
+                            "(1) current page screenshot:",
+                            pil_to_vertex(example_img),
+                        ]
+                    )
+                    message.append(f"Action: {y}")
+                message.append("Now make prediction given the observation")
+                message.append(f"Observation\n:{current}\n")
+                message.extend(
+                    [
+                        "IMAGES:",
+                        "(1) current page screenshot:",
+                        pil_to_vertex(page_screenshot_img),
+                    ]
+                )
+                for image_i, image in enumerate(images):
+                    message.extend(
+                        [
+                            f"({image_i+2}) input image {image_i+1}",
+                            pil_to_vertex(image),
+                        ]
+                    )
+                message.append("Action:")
+                return message
+            else:
+                raise ValueError(
+                    f"Gemini models do not support mode {self.lm_config.mode}"
+                )
+        else:
+            raise NotImplementedError(
+                f"Provider {self.lm_config.provider} not implemented"
+            )
+
+class MultimodalCoTPromptConstructor(EnhancedCoTPromptConstructor):
+    """The agent will perform step-by-step reasoning before the answer"""
+
+    def __init__(
+        self,
+        instruction_path: str | Path,
+        lm_config: lm_config.LMConfig,
+        tokenizer: Tokenizer,
+    ):
+        super().__init__(instruction_path, lm_config, tokenizer)
+        self.answer_phrase = self.instruction["meta_data"]["answer_phrase"]
 
     def get_lm_api_input(
         self,
