@@ -166,13 +166,16 @@ class PromptAgent(Agent):
         lm_config = self.lm_config
         n = 0
         while True:
-            response = call_llm(lm_config, prompt)
-            force_prefix = self.prompt_constructor.instruction[
-                "meta_data"
-            ].get("force_prefix", "")
-            response = f"{force_prefix}{response}"
-            if output_response:
-                print(f'Agent: {response}', flush=True)
+            if 'chain' in lm_config.model: # this prompt outputs the final action, not prompt
+                response = prompt
+            else:
+                response = call_llm(lm_config, prompt)
+                force_prefix = self.prompt_constructor.instruction[
+                    "meta_data"
+                ].get("force_prefix", "")
+                response = f"{force_prefix}{response}"
+                if output_response:
+                    print(f'Agent: {response}', flush=True)
             n += 1
             try:
                 parsed_response = self.prompt_constructor.extract_action(

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 from PIL import Image
 
-from browser_env import Action, ActionParsingError, Trajectory
+from browser_env import Action, ActionParsingError, Trajectory, create_id_based_action
 from browser_env.env_config import URL_MAPPINGS
 from browser_env.utils import StateInfo, pil_to_b64, pil_to_vertex
 from llms import lm_config
@@ -293,11 +293,14 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
         self,
         trajectory: Trajectory,
         intent: str,
+        page_screenshot_img,
+        images,
         meta_data: dict[str, Any] = {},
     ) -> APIInput:
         intro = self.instruction["intro"]
         examples = self.instruction["examples"]
         template = self.instruction["template"]
+
         keywords = self.instruction["meta_data"]["keywords"]
         state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
 
@@ -331,28 +334,48 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
         )
 
         assert all([f"{{k}}" not in current for k in keywords])
-        return self.iterative_refinement(intro, examples, current)
+        return self.iterative_refinement(intro, examples, current, page_screenshot_img, images)
 
     def iterative_refinement(
-        self, intro: str, examples: list[tuple[str, str]], current: str
+        self, intro: str, examples, current: str, page_screenshot_img, images
     ) -> APIInput:
         """
         Perform iterative refinement of reasoning and actions.
         """
+        most_recent_valid_action = None
         for iteration in range(self.max_iterations):
             # Generate reasoning and action
-            prompt = self.get_lm_api_input(intro, examples, current)
-            response = call_llm(self.lm_config, prompt)
-            reasoning, action = self.parse_response(response)
+            prompt = self.get_lm_api_input(intro, examples, current, page_screenshot_img, images)
+            n = 0
+            successful = False
+            while True:
+                n += 1
+                try:
+                    response = call_llm(self.lm_config, prompt)
+                    print(response)
+                    reasoning, action = self.parse_response(response)
+                    print(f'Parsed Action: {action}')
+                    most_recent_valid_action = action
+                    print(f'Most Recent Valid Action: {most_recent_valid_action}')
+                    successful = True
+                    break
+                except ActionParsingError as e:
+                    if n >= 3: # max retries
+                        break
 
             # Evaluate reasoning and action
-            if self.is_reasoning_valid(reasoning) and self.is_action_valid(action):
-                print(f"Final Reasoning after {iteration + 1} iterations:\n{reasoning}")
-                print(f"Final Action after {iteration + 1} iterations:\n{action}")
-                return action.strip()  # Return the refined action
+            if successful:
+                if self.is_reasoning_valid(reasoning) and self.is_action_valid(action):
+                    print(f"Final Reasoning after {iteration + 1} iterations:\n{reasoning}")
+                    print(f"Final Action after {iteration + 1} iterations:\n{action}")
+                    return action.strip()  # Return the refined action
 
-            # Construct dynamic feedback
-            feedback = self.construct_feedback(reasoning, action)
+                # Construct dynamic feedback
+                feedback = self.construct_feedback(reasoning, action)
+            else:
+                feedback = "Unable to parse answer."
+                reasoning = ""
+                action = ""
 
             # Refine reasoning based on feedback
             current += (
@@ -370,7 +393,11 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
                 "Please refine your reasoning and action based on the feedback provided above."
 
             )
-        raise ValueError("Failed to generate valid reasoning and action after maximum iterations.")
+
+        print(f"Most Recent Valid Action Final: {most_recent_valid_action}")
+        return f"```{most_recent_valid_action}```" if most_recent_valid_action is not None else ""
+        # cannot throw or else it won't continue
+        # raise ValueError("Failed to generate valid reasoning and action after maximum iterations.")
 
     def parse_response(self, response: str) -> tuple[str, str]:
         """
@@ -435,7 +462,7 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
             feedback_parts) if feedback_parts else "Good reasoning and action. No further refinement needed."
         return feedback
 
-class MultimodalCoTPromptConstructor(CoTPromptConstructor):
+class MultimodalCoTPromptConstructor(EnhancedCoTPromptConstructor):
     """The agent will perform step-by-step reasoning before the answer"""
 
     def __init__(
@@ -447,45 +474,45 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
         super().__init__(instruction_path, lm_config, tokenizer)
         self.answer_phrase = self.instruction["meta_data"]["answer_phrase"]
 
-    def construct(
-        self,
-        trajectory: Trajectory,
-        intent: str,
-        page_screenshot_img: Image.Image,
-        images: list[Image.Image],
-        meta_data: dict[str, Any] = {},
-    ) -> APIInput:
-        intro = self.instruction["intro"]
-        examples = self.instruction["examples"]
-        template = self.instruction["template"]
-        keywords = self.instruction["meta_data"]["keywords"]
-        state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
-
-        obs = state_info["observation"][self.obs_modality]
-        max_obs_length = self.lm_config.gen_config["max_obs_length"]
-        if max_obs_length:
-            if self.lm_config.provider == "google":
-                print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
-                obs = obs[:max_obs_length]
-            else:
-                obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
-
-        page = state_info["info"]["page"]
-        url = page.url
-        previous_action_str = meta_data["action_history"][-1]
-        current = template.format(
-            objective=intent,
-            url=self.map_url_to_real(url),
-            observation=obs,
-            previous_action=previous_action_str,
-        )
-
-        assert all([f"{{k}}" not in current for k in keywords])
-
-        prompt = self.get_lm_api_input(
-            intro, examples, current, page_screenshot_img, images
-        )
-        return prompt
+    # def construct(
+    #     self,
+    #     trajectory: Trajectory,
+    #     intent: str,
+    #     page_screenshot_img: Image.Image,
+    #     images: list[Image.Image],
+    #     meta_data: dict[str, Any] = {},
+    # ) -> APIInput:
+    #     intro = self.instruction["intro"]
+    #     examples = self.instruction["examples"]
+    #     template = self.instruction["template"]
+    #     keywords = self.instruction["meta_data"]["keywords"]
+    #     state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
+    #
+    #     obs = state_info["observation"][self.obs_modality]
+    #     max_obs_length = self.lm_config.gen_config["max_obs_length"]
+    #     if max_obs_length:
+    #         if self.lm_config.provider == "google":
+    #             print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
+    #             obs = obs[:max_obs_length]
+    #         else:
+    #             obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
+    #
+    #     page = state_info["info"]["page"]
+    #     url = page.url
+    #     previous_action_str = meta_data["action_history"][-1]
+    #     current = template.format(
+    #         objective=intent,
+    #         url=self.map_url_to_real(url),
+    #         observation=obs,
+    #         previous_action=previous_action_str,
+    #     )
+    #
+    #     assert all([f"{{k}}" not in current for k in keywords])
+    #
+    #     prompt = self.get_lm_api_input(
+    #         intro, examples, current, page_screenshot_img, images
+    #     )
+    #     return prompt
 
     def get_lm_api_input(
         self,
@@ -569,6 +596,8 @@ class MultimodalCoTPromptConstructor(CoTPromptConstructor):
                 )
         elif "google" in self.lm_config.provider:
             if self.lm_config.mode == "completion":
+                # heuristics_text = "It is important to follow heuristics. Please make sure to check that you have followed these heuristics at each step. Here are some heuristics to should follow: "
+                # heuristics_text += ",".join(heuristics)
                 message = [
                     intro,
                     "Here are a few examples:",
