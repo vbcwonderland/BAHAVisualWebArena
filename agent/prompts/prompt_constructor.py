@@ -466,7 +466,7 @@ class EnhancedCoTPromptConstructor(CoTPromptConstructor):
             feedback_parts) if feedback_parts else "Good reasoning and action. No further refinement needed."
         return feedback
 
-class MultimodalCoTPromptConstructorOld(EnhancedCoTPromptConstructor):
+class MultimodalCoTPromptConstructorOld(CoTPromptConstructor):
     """The agent will perform step-by-step reasoning before the answer"""
 
     def __init__(
