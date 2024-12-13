@@ -10,7 +10,14 @@ from browser_env.utils import StateInfo, pil_to_b64, pil_to_vertex
 from llms import lm_config
 from llms.tokenizers import Tokenizer
 from llms.utils import APIInput
-
+from llms import (
+    call_llm,
+    generate_from_huggingface_completion,
+    generate_from_openai_chat_completion,
+    generate_from_openai_completion,
+    generate_from_xai_chat_completion,
+    lm_config,
+)
 
 class Instruction(TypedDict):
     """Instruction for constructing prompt"""
@@ -268,6 +275,165 @@ class CoTPromptConstructor(PromptConstructor):
                 f'Cannot find the answer phrase "{self.answer_phrase}" in "{response}"'
             )
 
+class EnhancedCoTPromptConstructor(CoTPromptConstructor):
+    """The agent will perform iterative reasoning with self-reflection and refinement."""
+
+    def __init__(
+        self,
+        instruction_path: str | Path,
+        lm_config: lm_config.LMConfig,
+        tokenizer: Tokenizer,
+    ):
+        super().__init__(instruction_path, lm_config, tokenizer)
+        self.answer_phrase = self.instruction["meta_data"].get("answer_phrase", "")
+        self.action_splitter = self.instruction["meta_data"].get("action_splitter", "###")
+        self.max_iterations = 3  # Maximum times to refine reasoning
+
+    def construct(
+        self,
+        trajectory: Trajectory,
+        intent: str,
+        meta_data: dict[str, Any] = {},
+    ) -> APIInput:
+        intro = self.instruction["intro"]
+        examples = self.instruction["examples"]
+        template = self.instruction["template"]
+        keywords = self.instruction["meta_data"]["keywords"]
+        state_info: StateInfo = trajectory[-1]  # type: ignore[assignment]
+
+        obs = state_info["observation"][self.obs_modality]
+        max_obs_length = self.lm_config.gen_config["max_obs_length"]
+        if max_obs_length:
+            if self.lm_config.provider == "google":
+                print("NOTE: This is a Gemini model, so we use characters instead of tokens for max_obs_length.")
+                obs = obs[:max_obs_length]
+            else:
+                obs = self.tokenizer.decode(self.tokenizer.encode(obs)[:max_obs_length])  # type: ignore[arg-type]
+
+        page = state_info["info"]["page"]
+        url = page.url
+        previous_action_str = meta_data["action_history"][-1]
+
+        current = template.format(
+            objective=intent,
+            url=self.map_url_to_real(url),
+            observation=obs,
+            previous_action=previous_action_str,
+        )
+
+        # Add initial self-reflection prompt
+        current += (
+            "\n\nChain of Thought:\n"
+            "1. Can this step be broken into smaller, more manageable steps?\n"
+            "2. Is this step necessary or optimal to achieve the overall goal?\n"
+            "3. Does this step logically connect to the previous step?\n"
+            "Provide a clear reasoning process and suggest improvements if needed."
+        )
+
+        assert all([f"{{k}}" not in current for k in keywords])
+        return self.iterative_refinement(intro, examples, current)
+
+    def iterative_refinement(
+        self, intro: str, examples: list[tuple[str, str]], current: str
+    ) -> APIInput:
+        """
+        Perform iterative refinement of reasoning and actions.
+        """
+        for iteration in range(self.max_iterations):
+            # Generate reasoning and action
+            prompt = self.get_lm_api_input(intro, examples, current)
+            response = call_llm(self.lm_config, prompt)
+            reasoning, action = self.parse_response(response)
+
+            # Evaluate reasoning and action
+            if self.is_reasoning_valid(reasoning) and self.is_action_valid(action):
+                print(f"Final Reasoning after {iteration + 1} iterations:\n{reasoning}")
+                print(f"Final Action after {iteration + 1} iterations:\n{action}")
+                return action.strip()  # Return the refined action
+
+            # Construct dynamic feedback
+            feedback = self.construct_feedback(reasoning, action)
+
+            # Refine reasoning based on feedback
+            current += (
+                f"\n\nFeedback:\n"
+                f"Iteration {iteration + 1}: The reasoning or action is not satisfactory.\n"
+                f"Please regenerate the reasoning and action with the following feedback:\n"
+                f"- Reasoning: {reasoning}\n"
+                f"- Action: {action}\n"
+                f"Refinement Instructions:\n"
+                f"1. Ensure smaller, more manageable steps.\n"
+                f"2. Check if each step is necessary and optimal.\n"
+                f"3. Verify logical connection to the previous step."
+                f"\n\nFeedback (Iteration {iteration + 1}):\n"
+                f"{feedback}\n"
+                "Please refine your reasoning and action based on the feedback provided above."
+
+            )
+        raise ValueError("Failed to generate valid reasoning and action after maximum iterations.")
+
+    def parse_response(self, response: str) -> tuple[str, str]:
+        """
+        Extract reasoning and action from the response.
+        """
+        pattern = rf"{self.action_splitter}((.|\n)*?){self.action_splitter}"
+        match = re.search(pattern, response)
+        if match:
+            reasoning = match.group(1).split("Chain of Thought:")[1] if "Chain of Thought:" in match.group(1) else ""
+            action = match.group(1).split("Action:")[1] if "Action:" in match.group(1) else match.group(1).strip()
+            return reasoning.strip(), action.strip()
+        else:
+            raise ActionParsingError(f"Cannot parse response: {response}")
+
+    def is_reasoning_valid(self, reasoning: str) -> bool:
+        """
+        Evaluate if the reasoning meets criteria.
+        """
+        return all([
+            "smaller" in reasoning or "manageable" in reasoning,  # Indicates granularity
+            "necessary" in reasoning or "optimal" in reasoning,  # Indicates necessity
+            "connect" in reasoning or "logical" in reasoning,    # Indicates linkage
+        ])
+
+    def is_action_valid(self, action: str) -> bool:
+        """
+        Evaluate if the action is reasonable.
+        """
+        return len(action) > 0 and not action.startswith("I don't know")  # Example validation
+
+    def construct_feedback(self, reasoning: str, action: str) -> str:
+        """
+        Construct dynamic feedback based on the agent's reasoning and action.
+        """
+        feedback_parts = []
+
+        # Check if reasoning lacks granularity
+        if "smaller" not in reasoning and "manageable" not in reasoning:
+            feedback_parts.append(
+                "Your reasoning lacks granularity. Consider breaking the step into smaller, more manageable parts."
+            )
+
+        # Check if reasoning lacks necessity
+        if "necessary" not in reasoning and "optimal" not in reasoning:
+            feedback_parts.append(
+                "Your reasoning does not clearly justify why this step is necessary or optimal for the overall goal."
+            )
+
+        # Check if reasoning lacks logical linkage
+        if "connect" not in reasoning and "logical" not in reasoning:
+            feedback_parts.append(
+                "Your reasoning does not establish a clear logical connection between the previous step and this step."
+            )
+
+        # Check if the action is insufficient or invalid
+        if len(action.strip()) == 0 or "I don't know" in action:
+            feedback_parts.append(
+                "The action you proposed is invalid or incomplete. Propose a concrete, actionable step.")
+
+        # Combine feedback into a single string
+        feedback = " ".join(
+            feedback_parts) if feedback_parts else "Good reasoning and action. No further refinement needed."
+        return feedback
 
 class MultimodalCoTPromptConstructor(CoTPromptConstructor):
     """The agent will perform step-by-step reasoning before the answer"""
