@@ -1,4 +1,6 @@
-Project based on VisualWebArena https://github.com/web-arena-x/visualwebarena 
+Project based on VisualWebArena https://github.com/web-arena-x/visualwebarena for BAHA team in course 11777 Multimodal machine learning class. 
+
+The followings are the envrionement set up for VisualWebArena 
 
 
 # VisualWebArena: Evaluating Multimodal Agents on Realistic Visual Web Tasks
