@@ -1,102 +1,75 @@
-"""Tools to generate from OpenAI prompts.
-Adopted from https://github.com/zeno-ml/zeno-build/"""
-
-import asyncio
-import logging
 import os
-import random
-import time
-from typing import Any
-
-import aiolimiter
+from typing import List
 import openai
-from openai import AsyncOpenAI, OpenAI
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    HarmBlockThreshold,
-    HarmCategory,
-    Image,
-)
+from openai import OpenAI
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
+
+if not XAI_API_KEY:
+    raise EnvironmentError("XAI_API_KEY is not set or is inaccessible.")
+
+print("XAI_API_KEY:", XAI_API_KEY)
+
+
 client = OpenAI(
     api_key=XAI_API_KEY,
     base_url="https://api.x.ai/v1",
 )
 
-
-
-def retry_with_exponential_backoff(  # type: ignore
-    func,
-    initial_delay: float = 1,
-    exponential_base: float = 2,
-    jitter: bool = True,
-    max_retries: int = 3,
-    errors: tuple[Any] = (
-        openai.RateLimitError,
-        openai.BadRequestError,
-        openai.InternalServerError,
-    ),
-):
-    """Retry a function with exponential backoff."""
-
-    def wrapper(*args, **kwargs):  # type: ignore
-        num_retries = 0
-        delay = initial_delay
-
-        while num_retries < max_retries:
-            try:
-                return func(*args, **kwargs)
-            except errors as e:
-                num_retries += 1
-                if num_retries == max_retries:
-                    raise
-                time.sleep(delay)
-                delay *= exponential_base * (1 + random.random() * jitter)
-
-    return wrapper
-
-@retry_with_exponential_backoff
-def generate_from_xai_chat_completion(
-    messages: list[dict[str, str]],
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    top_p: float,
-    context_length: int,
-    stop_token: str | None = None,
+def generate_from_grok_vision_url(
+    text_prompt: str,
+    image_urls: List[str],
+    model: str = "grok-vision-beta",
+    temperature: float = 0.01,
 ) -> str:
-    if "XAI_API_KEY" not in os.environ:
-        raise ValueError(
-            "XAI_API_KEY environment variable must be set when using XAI API."
-        )
-    model = "grok-beta"
-    response = client.chat.completions.create(
+    """
+    Generate content from xAI's grok-vision-beta model using text and image URLs.
+
+    Args:
+        text_prompt: Text prompt describing the task or question.
+        image_urls: List of URLs to images.
+        model: Model name to use (default: grok-vision-beta).
+        temperature: Sampling temperature for response diversity.
+
+    Returns:
+        Generated response as a string.
+    """
+    # Prepare messages with text and image URLs
+    content = [
+        {"type": "image_url", "image_url": {"url": url, "detail": "high"}}
+        for url in image_urls
+    ]
+    content.append({"type": "text", "text": text_prompt})
+
+    messages = [{"role": "user", "content": content}]
+
+    # Send the request to xAI
+    stream = client.chat.completions.create(
         model=model,
         messages=messages,
+        stream=True,
         temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
     )
-    answer: str = response.choices[0].message.content
-    return answer
 
+    # Aggregate and return the response
+    response = ""
+    for chunk in stream:
+        response += chunk.choices[0].delta.content
+    return response
 
-@retry_with_exponential_backoff
-# debug only
-def fake_generate_from_openai_chat_completion(
-    messages: list[dict[str, str]],
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    top_p: float,
-    context_length: int,
-    stop_token: str | None = None,
-) -> str:
-    if "XAI_API_KEY" not in os.environ:
-        raise ValueError(
-            "XAI_API_KEY environment variable must be set when using XAI API."
+# Example Usage
+if __name__ == "__main__":
+    text_prompt = "Describe this image?"
+    image_urls = [
+        "https://x.ai/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Faurora.577c2a9b.png&w=1080&q=75",
+    ]
+
+    try:
+        # Generate response using grok-vision-beta
+        result = generate_from_grok_vision_url(
+            text_prompt=text_prompt,
+            image_urls=image_urls
         )
-
-    answer = "Let's think step-by-step. This page shows a list of links and buttons. There is a search box with the label 'Search query'. I will click on the search box to type the query. So the action I will perform is \"click [60]\"."
-    return answer
+        print("Generated Response:", result)
+    except Exception as e:
+        print(f"An error occurred: {e}")
